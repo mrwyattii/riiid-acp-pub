@@ -1,0 +1,6 @@
+deepspeed==0.6.1
+fastai==2.5.6
+numpy==1.17.4
+pandas==0.25.3
+scikit_learn==1.0.2
+torch==1.10.1
