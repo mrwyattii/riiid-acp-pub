@@ -7,6 +7,7 @@ import time
 start_time = time.time()
 
 from argparse import ArgumentParser
+import re
 import os
 import sys
 
@@ -22,6 +23,9 @@ import enum
 
 from fastai.basics import AttrDict
 
+from pynvml import *
+nvmlInit()
+
 from collections import defaultdict
 #from fastcore.script import *
 #from matplotlib import pyplot as plt
@@ -34,6 +38,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.distributions.beta import Beta
 from torch.utils.data.distributed import DistributedSampler
+from pytorch_block_sparse.util import ModelPatcher
 
 # Ugly hack because of notebook that generates data
 _H = AttrDict
@@ -587,26 +592,56 @@ def main(args):
 
     # TORCH DISTRIBUTED
     else:
+        if args.local_rank == 0:
+            h = nvmlDeviceGetHandleByIndex(0)
+            print("MEMORY USAGE 1 (init):", torch.cuda.memory_allocated(0)/(1024**3), '/', torch.cuda.max_memory_allocated(0)/(1024**3))
+            info = nvmlDeviceGetMemoryInfo(h)
+            print("total/free/used", f"{info.total/(1024**3)}/{info.free/(1024**3)}/{info.used/(1024**3)}")
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
         criterion = (lambda x,y: ua_loss_func(x, y, args))
+        scaler = torch.cuda.amp.GradScaler()
+
+        #model = model.half()
+        #if args.local_rank == 0:
+        #    print(model)
+        #    print(sum(p.numel() for p in model.parameters()))
+        #    print(sum(p.numel() for p in model.parameters() if p.requires_grad))
 
         model = model.cuda(args.local_rank)
         model = nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank])
+        if args.local_rank == 0:
+            print("MEMORY USAGE 2 (model):", torch.cuda.memory_allocated(0)/(1024**3), '/', torch.cuda.max_memory_allocated(0)/(1024**3))
+            info = nvmlDeviceGetMemoryInfo(h)
+            print("total/free/used", f"{info.total/(1024**3)}/{info.free/(1024**3)}/{info.used/(1024**3)}")
 
         start = time.time()
         for step, batch in enumerate(train_dl):
+            optimizer.zero_grad()
             if step % 100 == 0 and args.local_rank == 0:
                 print(f"batch step {step} / {len(train_dl)}, total datapoints: {len(train_dl.dataset)}")
                 if step == 0:
                     sizes = [a.element_size() * a.nelement() for a in batch]
                     print("data sizes:", sizes)
-            batch = [val.cuda(args.local_rank) for val in batch]
+            inputs = [val.cuda(args.local_rank) for val in batch[:-1]]
+            if args.local_rank == 0:
+                print(f"Step {step}, MEMORY USAGE 3 (train loop):", torch.cuda.memory_allocated(0)/(1024**3), '/', torch.cuda.max_memory_allocated(0)/(1024**3))
+                info = nvmlDeviceGetMemoryInfo(h)
+                print("total/free/used", f"{info.total/(1024**3)}/{info.free/(1024**3)}/{info.used/(1024**3)}")
+                print("Tensor size (GB):", sum([a.element_size() * a.nelement() for a in batch])/(1e9))
 
-            outputs = model(*batch[:-1])
-            loss = criterion(outputs, batch[-1])
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast():
+                outputs = model(*inputs)
+                del inputs
+                loss = criterion(outputs, batch[-1].cuda(args.local_rank))
+                del outputs
+            if step == 3:
+                sys.exit()
+            scaler.scale(loss).backward()
+            del loss
+            scaler.step(optimizer)
+            scaler.update()
+            #loss.backward()
+            #optimizer.step()
 
         if args.local_rank == 0:
             print(f" Total Time: {time.time() - start}")
