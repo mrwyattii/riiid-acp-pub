@@ -11,7 +11,7 @@ import re
 import os
 import sys
 
-import deepspeed
+#import deepspeed
 
 import ast
 import enum
