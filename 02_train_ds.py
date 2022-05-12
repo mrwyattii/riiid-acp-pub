@@ -11,7 +11,7 @@ import re
 import os
 import sys
 
-#import deepspeed
+import deepspeed
 
 import ast
 import enum
@@ -23,8 +23,8 @@ import enum
 
 from fastai.basics import AttrDict
 
-from pynvml import *
-nvmlInit()
+#from pynvml import *
+#nvmlInit()
 
 from collections import defaultdict
 #from fastcore.script import *
@@ -354,6 +354,7 @@ class TutorNet(nn.Module):
         x_cat += 1
         x_tags += 1
 
+        deepspeed.runtime.utils.see_memory_usage('model-1', force=True)
         # compute masks
         causal_mask = torch.triu(
             torch.ones(1, sl, sl, dtype=torch.bool, device=x_cat.device), diagonal=1
@@ -370,6 +371,7 @@ class TutorNet(nn.Module):
 
         padding_mask = x_mask
 
+        deepspeed.runtime.utils.see_memory_usage('model-2', force=True)
         # encoder x (shifted q & a)
         enc_cat = torch.zeros_like(x_cat)
         enc_cont = torch.zeros_like(x_cont)
@@ -381,12 +383,14 @@ class TutorNet(nn.Module):
         enc_tags[:, 1:] = x_tags[:, :-1]
         enc_tagw[:, 1:] = x_tagw[:, :-1]
 
+        deepspeed.runtime.utils.see_memory_usage('model-3', force=True)
         # decoder x (nonshifted q)
         dec_cat = x_cat
         dec_cont = x_cont
         dec_tags = x_tags
         dec_tagw = x_tagw
 
+        deepspeed.runtime.utils.see_memory_usage('model-4', force=True)
         # hide correct answer and user answered correctly from decoder
         dec_cat[..., self.Cats.answered_correctly] = 0
         dec_cat[..., self.Cats.user_answer] = 0
@@ -394,6 +398,7 @@ class TutorNet(nn.Module):
         dec_cont[..., self.Conts.qet] = 0
         dec_cont[..., self.Conts.qet_log] = 0
 
+        deepspeed.runtime.utils.see_memory_usage('model-5', force=True)
         # print(enc_cont.shape)
         enc_cat = enc_cat.view(b * sl, catf)  # b*sl, catf
         enc_tags = enc_tags.view(b * sl, tagsf)  # b*sl, tagsf
@@ -403,6 +408,7 @@ class TutorNet(nn.Module):
         dec_tags = dec_tags.view(b * sl, tagsf)  # b*sl, tagsf
         dec_tagw = dec_tagw.view(b * sl, tagsf)  # b*sl, tagsf
 
+        deepspeed.runtime.utils.see_memory_usage('model-6', force=True)
         # embed categorical vars
         enc = torch.mean(
             torch.stack(
@@ -415,6 +421,7 @@ class TutorNet(nn.Module):
             dim=0,
         )
 
+        deepspeed.runtime.utils.see_memory_usage('model-7', force=True)
         dec = torch.mean(
             torch.stack(
                 [
@@ -429,6 +436,7 @@ class TutorNet(nn.Module):
         enc = enc.view(b, sl, self.trf_dim)  # b, sl, sum of cat, cont and tag ftrs
         dec = dec.view(b, sl, self.trf_dim)  # b, sl, sum of cat, cont and tag ftrs
 
+        deepspeed.runtime.utils.see_memory_usage('model-8', force=True)
         if shuffle is not None:
             enc = torch.lerp(enc, enc[shuffle], lam.view(lam.shape[0], 1, 1))
             dec = torch.lerp(dec, dec[shuffle], lam.view(lam.shape[0], 1, 1))
@@ -440,12 +448,14 @@ class TutorNet(nn.Module):
         enc = enc.permute(1, 0, 2)  # sl, b, tf (torchformer input)
         dec = dec.permute(1, 0, 2)  # sl, b, tf
 
+        deepspeed.runtime.utils.see_memory_usage('model-9', force=True)
         expand_nheads = (
             lambda t: t.unsqueeze(1)
             .expand(t.shape[0], self.nhead, -1, -1)
             .reshape(-1, *t.shape[-2:])
         )
 
+        deepspeed.runtime.utils.see_memory_usage('model-10', force=True)
         o = self.trafo(
             enc,
             dec,
@@ -456,8 +466,10 @@ class TutorNet(nn.Module):
             tgt_key_padding_mask=padding_mask,
             memory_key_padding_mask=padding_mask,
         )  # sl, b, tf
+        deepspeed.runtime.utils.see_memory_usage('model-11', force=True)
         o = o.permute(1, 0, 2)  # b, sl, tf
         o = self.mlp(o)  # b, sl, of (of=2)
+        deepspeed.runtime.utils.see_memory_usage('model-12', force=True)
         # print(o)
         return o
 
@@ -551,7 +563,9 @@ def main(args):
     # DeepSpeed only
     if args.no_torch_dist:
         ds_config = {
+            "steps_per_print": 100,
             "train_micro_batch_size_per_gpu": args.batch_size,
+            "zero_allow_untested_optimizer": True,
             "optimizer": {
                 "type": "ADAM",
                 "params": {
@@ -559,33 +573,55 @@ def main(args):
                 }
             },
             "fp16": {
-                "enabled": False
+                "enabled": True
             },
             "zero_optimization": {
-                "stage": 1,
-                "cpu_offload": True
-            }
+                "stage": 3,
+                "cpu_offload": False
+           }
         }
-        '''
-                "offload_optimizer": {
-                    "device": "cpu"
-                }
-        '''
 
+        deepspeed.runtime.utils.see_memory_usage('pre-init', force=True)
         criterion = (lambda x,y: ua_loss_func(x, y, args))
         model, _, _, _ = deepspeed.initialize(model=model,
                                               model_parameters=model.parameters(),
                                               config=ds_config)
-        start = time.time()
         for step, batch in enumerate(train_dl):
-            if step % 100 == 0 and args.local_rank == 0:
-                print(f"batch step {step} / {len(train_dl)}")
+            break
+        deepspeed.runtime.utils.see_memory_usage('post-init', force=True)
+        batch = [val.cuda(args.local_rank).half()
+                 if i in [2,4]
+                 else val.cuda(args.local_rank)
+                 for i,val in enumerate(batch)]
+        deepspeed.runtime.utils.see_memory_usage('post-batch', force=True)
+        outputs = model(*batch[:-1])
+        deepspeed.runtime.utils.see_memory_usage('post-fp', force=True)
+        loss = criterion(outputs, batch[-1])
+        deepspeed.runtime.utils.see_memory_usage('post-loss', force=True)
+        model.backward(loss)
+        deepspeed.runtime.utils.see_memory_usage('post-bp', force=True)
+        model.step()
+        deepspeed.runtime.utils.see_memory_usage('post-step', force=True)
+        print('params:', sum(p.numel() for p in model.parameters() if p.requires_grad))
+        sys.exit()
+
+
+        start = time.time()
+        losses = []
+        for step, batch in enumerate(train_dl):
+            deepspeed.runtime.utils.see_memory_usage('train-loop', force=True)
+            if step % 50 == 0 and args.local_rank == 0:
+                print(f"batch step {step} / {len(train_dl)}, loss {np.mean(losses)}")
             #batch = [val.to(device).half() if (i==2 or i==4) else val.to(device) for i,val in enumerate(batch)]
-            batch = [val.cuda(args.local_rank) for val in batch]
+            batch = [val.cuda(args.local_rank).half() if i in [2,4] else val.cuda(args.local_rank) for i,val in enumerate(batch)]
             outputs = model(*batch[:-1])
             loss = criterion(outputs, batch[-1])
+            losses.append(loss.clone().item())
             model.backward(loss)
             model.step()
+
+        #print(losses)
+        print(f"loss: {np.mean(losses)}")
 
         if args.local_rank == 0:
             print(f" Total Time: {time.time() - start}")
